@@ -34,6 +34,8 @@ class _GameTile extends StatelessWidget {
     return FilledButton.tonal(
       style: FilledButton.styleFrom(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        // Set on the button, not the Text, so the text keeps the button's contrast colour.
+        textStyle: Theme.of(context).textTheme.headlineSmall,
       ),
       onPressed: () =>
           Navigator.of(context)
@@ -43,11 +45,7 @@ class _GameTile extends StatelessWidget {
         children: [
           Icon(game.icon, size: 72),
           const SizedBox(height: 12),
-          Text(
-            game.title,
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.headlineSmall,
-          ),
+          Text(game.title, textAlign: TextAlign.center),
         ],
       ),
     );
