@@ -1,0 +1,174 @@
+name: release-finish
+
+# Closes the GitFlow loop once the release pull request lands on main: tags the merge
+# commit, drafts the GitHub release, and opens the back-merge into develop.
+#
+# The release is left as a DRAFT on purpose. Publishing it is what ships the app to the
+# stores, and that is meant to be a human action -- a release published by GITHUB_TOKEN
+# would not fire prod.yml anyway.
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  finish:
+    if: >-
+      github.event.pull_request.merged == true
+      && (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/'))
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write        # push the tag, create the release
+      pull-requests: write   # open the back-merge
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # The changelog section is rebuilt from the history since the previous tag.
+          fetch-depth: 0
+
+      - id: meta
+        name: Read the version from the branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          version="${HEAD_REF#*/}"   # release/1.4.0 -> 1.4.0
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      # The ruleset allows merge, squash and rebase on main. Only a merge commit keeps
+      # the release branch's commits in the history that develop later back-merges; a
+      # squash or rebase replaces them, which silently breaks three things at once.
+      - id: method
+        name: Check how the pull request was merged
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          parents="$(git rev-list --parents -n 1 "$MERGE_SHA" | wc -w)"
+          if [[ "$parents" -ge 3 ]]; then
+            echo "squashed=false" >> "$GITHUB_OUTPUT"
+            echo "merged with a merge commit"
+            exit 0
+          fi
+
+          echo "squashed=true" >> "$GITHUB_OUTPUT"
+          echo "::warning title=Release was squashed or rebased::The release notes below \
+          are probably incomplete, the back-merge into develop will likely conflict, and \
+          the next release will list these commits again. See docs/RELEASING.md."
+
+      - name: Tag the release
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+            echo "::notice::$TAG already exists, leaving it alone"
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" "$MERGE_SHA" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "tagged $MERGE_SHA as $TAG"
+
+      - id: notes
+        name: Rebuild the changelog section for the release notes
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The tag just pushed is the newest, so exclude it when looking for the
+          # previous one -- otherwise the range would be empty.
+          git tag -d "$TAG" >/dev/null 2>&1 || true
+          # A scratch file, not /dev/null: the script rewrites the file it is given.
+          # CHANGELOG.md on main already has this section from the release branch.
+          ./.github/scripts/release-changelog.sh "$VERSION" "$(mktemp)" > notes.md
+          echo "wrote $(wc -l < notes.md) lines of notes"
+
+      - name: Draft the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SQUASHED: ${{ steps.method.outputs.squashed }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::release $TAG already exists, leaving it alone"
+            exit 0
+          fi
+          {
+            if [[ "$SQUASHED" == "true" ]]; then
+              printf '> **These notes are probably incomplete.** The release pull request\n'
+              printf '> was squashed or rebased instead of merged, so the individual\n'
+              printf '> commits are no longer in the history these notes are built from.\n\n'
+            fi
+            cat notes.md
+            printf '\n---\n\n'
+            printf 'Publishing this release ships it to the stores.\n'
+          } > release-body.md
+          gh release create "$TAG" \
+            --draft \
+            --target main \
+            --title "$VERSION" \
+            --notes-file release-body.md
+          echo "drafted release $TAG"
+
+      - name: Open the back-merge into develop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          SQUASHED: ${{ steps.method.outputs.squashed }}
+        run: |
+          set -euo pipefail
+          # GitFlow merges a release into main AND back into develop; without this,
+          # develop never gets the version bump or the changelog. A pull request rather
+          # than a direct push, because the ruleset protects develop too.
+          branch="chore/back-merge-$VERSION"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "::notice::$branch already exists, leaving it alone"
+            exit 0
+          fi
+
+          git switch -c "$branch" main
+          git push origin "$branch"
+
+          # Markdown backticks in the format strings, not command substitution.
+          # shellcheck disable=SC2016
+          {
+            printf 'Brings `main` back into `develop` after releasing `%s`.\n\n' "$VERSION"
+            printf 'Without this, `develop` is missing the version bump and the changelog\n'
+            printf 'from the release branch, and the next release would reintroduce them.\n'
+            if [[ "$SQUASHED" == "true" ]]; then
+              printf '\n> **Expect conflicts.** The release pull request was squashed or\n'
+              printf '> rebased, so `main` carries one commit where `develop` has the\n'
+              printf '> originals. Resolve by keeping the `main` side of `CHANGELOG.md`\n'
+              printf '> and `pubspec.yaml`.\n'
+            fi
+          } > body.md
+          jq -n --arg t "chore: back-merge release $VERSION into develop" \
+                --arg h "$branch" --rawfile b body.md \
+            '{title: $t, head: $h, base: "develop", body: $b}' > pr.json
+
+          number="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" --input pr.json --jq '.number')"
+          echo "opened back-merge pull request #$number"
+          {
+            echo "### Release $TAG"
+            echo
+            echo "- tagged \`$TAG\` on \`main\`"
+            echo "- drafted the GitHub release -- publishing it ships to the stores"
+            echo "- back-merge pull request #$number into \`develop\`"
+            if [[ "$SQUASHED" == "true" ]]; then
+              echo
+              echo "> The pull request was squashed or rebased, not merged. The notes are"
+              echo "> probably incomplete and the back-merge will likely conflict."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

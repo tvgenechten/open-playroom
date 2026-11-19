@@ -1,0 +1,26 @@
+name: open_playroom
+description: "Open-source games app without ads, tracking or internet."
+publish_to: 'none'
+
+# Written by release-start. CI adds the build number (the commit count), which the
+# stores need to go up with every upload.
+version: 0.0.0
+
+environment:
+  sdk: ^3.13.4
+  # Exact, so CI (flutter-version-file) builds with the same Flutter as you do.
+  flutter: 3.47.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

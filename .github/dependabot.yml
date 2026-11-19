@@ -1,0 +1,25 @@
+version: 2
+
+# Prefixes follow the commit convention, so CHANGELOG.md files the bumps under chore
+# instead of "Other".
+updates:
+  - package-ecosystem: pub
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      pub-minor-and-patch:
+        update-types: [minor, patch]
+
+  # Keeps the SHA pins and their version comments current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      actions:
+        patterns: ['*']

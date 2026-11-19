@@ -1,0 +1,47 @@
+name: prod
+
+# Publishing the GitHub release drafted by release-finish ships the app: the build that
+# test-release put on the Play internal testing track is promoted to production.
+#
+# iOS stays a manual step on purpose: in App Store Connect, pick the TestFlight build of
+# this version and submit it for review (docs/RELEASING.md). Apple asks review questions
+# a workflow cannot answer.
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  android:
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Promote internal testing to production
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PLAY_JSON" ]]; then
+            echo "::error::secret PLAY_SERVICE_ACCOUNT_JSON is not set. See docs/RELEASING.md."
+            exit 1
+          fi
+          gem install fastlane --no-document --user-install
+          "$(ruby -e 'print Gem.user_dir')/bin/fastlane" supply \
+            --package_name app.openplayroom \
+            --track internal \
+            --track_promote_to production \
+            --json_key_data "$PLAY_JSON" \
+            --skip_upload_apk --skip_upload_aab --skip_upload_metadata \
+            --skip_upload_changelogs --skip_upload_images --skip_upload_screenshots
+
+      - name: Summary
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          {
+            echo "### $TAG shipped"
+            echo
+            echo "- Android: promoted from internal testing to production"
+            echo "- iOS: submit the TestFlight build for review in App Store Connect"
+          } >> "$GITHUB_STEP_SUMMARY"

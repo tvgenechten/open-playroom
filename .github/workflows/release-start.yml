@@ -1,0 +1,180 @@
+name: release-start
+
+# Starts a GitFlow release: cuts the branch, writes the version and the changelog,
+# opens the pull request into main and sends a test build to the store test tracks.
+#
+# Merging that pull request is deliberately left to a person.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without a leading v, e.g. 1.4.0
+        required: true
+        type: string
+      kind:
+        description: release branches off develop, hotfix off main
+        required: false
+        default: release
+        type: choice
+        options: [release, hotfix]
+
+permissions: {}
+
+jobs:
+  start:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write        # push the branch and the release commit
+      pull-requests: write   # open the pull request
+      actions: write         # dispatch test-release.yml
+    steps:
+      - id: check
+        name: Validate the version
+        env:
+          VERSION: ${{ inputs.version }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          # No prerelease suffix: Android and iOS only accept plain X.Y.Z version names.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$VERSION' is not a version the stores accept. Expected 1.4.0."
+            exit 1
+          fi
+          # GitFlow: a release prepares what is on develop, a hotfix patches what is live.
+          base=develop
+          [[ "$KIND" == "hotfix" ]] && base=main
+          {
+            echo "version=$version"
+            echo "branch=$KIND/$version"
+            echo "base=$base"
+          } >> "$GITHUB_OUTPUT"
+          echo "preparing $KIND/$version from $base"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.check.outputs.base }}
+          # The changelog is built from the history since the previous tag.
+          fetch-depth: 0
+
+      - name: Refuse to start twice
+        env:
+          BRANCH: ${{ steps.check.outputs.branch }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::$BRANCH already exists. Delete it, or pick another version."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION already exists, so $VERSION has already been released."
+            exit 1
+          fi
+
+      - name: Refuse an empty release
+        if: inputs.kind == 'release'
+        run: |
+          set -euo pipefail
+          # A hotfix is cut from main and may legitimately start out empty; a release
+          # that carries nothing is a mistake.
+          count="$(git rev-list --count origin/main..HEAD)"
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::develop has nothing that main does not. Nothing to release."
+            exit 1
+          fi
+          echo "$count commits to release"
+
+      - name: Write the version and the changelog
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git switch -c "$BRANCH"
+
+          sed -i -E "s|^version: .*|version: ${VERSION}|" pubspec.yaml
+          if ! grep -q "^version: ${VERSION}$" pubspec.yaml; then
+            echo "::error::pubspec.yaml has no version line to rewrite."
+            exit 1
+          fi
+
+          # The README version badge is the only copy of the version outside pubspec.yaml.
+          # The query form of the shields.io URL keeps the rewrite safe.
+          sed -i -E "s|(static/v1\?label=version&message=)[^&]+|\1${VERSION}|" README.md
+          # A renamed or reformatted badge would leave the sed matching nothing and the
+          # version silently behind.
+          if ! grep -q "message=${VERSION}&" README.md; then
+            echo "::error::README.md has no version badge to rewrite. Has it been renamed?"
+            exit 1
+          fi
+
+          # Also to stdout, so the pull request can reuse the section.
+          ./.github/scripts/release-changelog.sh "$VERSION" > changelog-section.md
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add pubspec.yaml CHANGELOG.md README.md
+          git commit -m "chore: prepare release $VERSION"
+          git push origin "$BRANCH"
+
+      - id: pr
+        name: Open the pull request into main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.check.outputs.version }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+          KIND: ${{ inputs.kind }}
+        run: |
+          set -euo pipefail
+          # Markdown backticks in the format strings, not command substitution.
+          # shellcheck disable=SC2016
+          {
+            printf 'Prepared by `release-start`. Review the changes, then merge.\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| version | `%s` |\n' "$VERSION"
+            printf '| branch | `%s` |\n\n' "$BRANCH"
+            printf -- '- [ ] the build from `test-release` works on a phone and a tablet\n'
+            printf -- '      (Play internal testing track / TestFlight)\n'
+            printf -- '- [ ] the changelog below is accurate\n'
+            printf -- '- [ ] **merged with a merge commit** -- not squash, not rebase\n\n'
+            printf 'A squash or rebase replaces the commits, so the tag ends up outside the\n'
+            printf 'history `develop` back-merges. The release notes come out short, the next\n'
+            printf "changelog lists these commits again, and the back-merge conflicts.\n\n"
+            printf 'A fix pushed to this branch needs `test-release` run again on it.\n\n'
+            printf 'Merging this opens the back-merge into `develop`, tags `v%s` and drafts the\n' "$VERSION"
+            printf 'GitHub release. Publishing that release is what ships it to the stores.\n\n'
+            printf -- '---\n\n'
+            cat changelog-section.md
+          } > pr-body.md
+
+          jq -n --arg t "chore: $KIND $VERSION" --arg h "$BRANCH" --rawfile b pr-body.md \
+            '{title: $t, head: $h, base: "main", body: $b}' > pr.json
+          number="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" --input pr.json --jq '.number')"
+          echo "pr_number=$number" >> "$GITHUB_OUTPUT"
+          echo "opened pull request #$number"
+
+      - name: Send a test build to the stores
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # Dispatched rather than left to a pull_request trigger: a pull request opened
+          # with GITHUB_TOKEN creates runs that wait for approval; workflow_dispatch runs.
+          gh workflow run test-release.yml --ref "$BRANCH"
+          echo "dispatched test-release on $BRANCH"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          {
+            echo "### Release $VERSION started"
+            echo
+            echo "- branch \`$BRANCH\`"
+            echo "- pull request #$PR_NUMBER into \`main\`"
+            echo "- test build dispatched"
+          } >> "$GITHUB_STEP_SUMMARY"

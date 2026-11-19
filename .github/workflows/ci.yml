@@ -1,0 +1,54 @@
+name: ci
+
+# The merge gate: every pull request into develop or main has to pass this before the
+# ruleset lets it in.
+on:
+  pull_request:
+    branches: [develop, main]
+  # Pull requests opened by a workflow (release-start, release-finish) wait behind an
+  # approval banner; a manual dispatch always runs.
+  workflow_dispatch:
+
+permissions: {}
+
+# A new push to the same pull request makes the running checks worthless.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Pull request title follows the commit convention
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # CONTRIBUTING section 2. The title becomes the merge commit subject, and with
+          # it a line in CHANGELOG.md.
+          if [[ ! "$TITLE" =~ ^(feat|fix|refactor|test|docs|chore)(\([a-z0-9-]+\))?!?:\ [^A-Z].*[^.]$ ]]; then
+            echo "::error::'$TITLE' is not 'type(scope): description'. See CONTRIBUTING.md section 2."
+            exit 1
+          fi
+
+  app:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - run: flutter pub get
+      - run: dart format --output=none --set-exit-if-changed .
+      - run: flutter analyze
+      # Includes test/no_network_test.dart: no network, ads or tracking may slip in.
+      - run: flutter test
+      # Catches Gradle and manifest breakage the tests cannot see.
+      - run: flutter build apk --debug

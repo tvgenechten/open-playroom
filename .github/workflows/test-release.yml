@@ -1,0 +1,138 @@
+name: test-release
+
+# Builds a release or hotfix branch and uploads it to the Play internal testing track and
+# to TestFlight. Dispatched by release-start; run it again by hand after pushing a fix to
+# the release branch. Publishing the GitHub release later promotes exactly this build.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: test-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    if: startsWith(github.ref_name, 'release/') || startsWith(github.ref_name, 'hotfix/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The build number is the commit count, so the whole history is needed.
+          fetch-depth: 0
+
+      - name: Check the secrets
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in KEYSTORE KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD PLAY_JSON; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::a secret for $name is not set. See docs/RELEASING.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Build the signed app bundle
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/upload.jks"
+          # Read by android/app/build.gradle.kts.
+          {
+            echo "storeFile=$RUNNER_TEMP/upload.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+          flutter build appbundle --release --build-number="$(git rev-list --count HEAD)"
+
+      - name: Upload to the Play internal testing track
+        env:
+          PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          gem install fastlane --no-document --user-install
+          "$(ruby -e 'print Gem.user_dir')/bin/fastlane" supply \
+            --package_name app.openplayroom \
+            --track internal \
+            --aab build/app/outputs/bundle/release/app-release.aab \
+            --json_key_data "$PLAY_JSON" \
+            --skip_upload_metadata --skip_upload_changelogs \
+            --skip_upload_images --skip_upload_screenshots
+
+  ios:
+    if: startsWith(github.ref_name, 'release/') || startsWith(github.ref_name, 'hotfix/')
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check the secrets
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY: ${{ secrets.APP_STORE_CONNECT_KEY_BASE64 }}
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in KEY_ID ISSUER_ID KEY TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::the secret or variable for $name is not set. See docs/RELEASING.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Build, sign and upload to TestFlight
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY: ${{ secrets.APP_STORE_CONNECT_KEY_BASE64 }}
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/AuthKey.p8"
+          echo "$KEY" | base64 --decode > "$key_path"
+          # Xcode cloud signing with the App Store Connect API key: no certificates or
+          # provisioning profiles to keep in secrets.
+          auth=(-allowProvisioningUpdates
+                -authenticationKeyPath "$key_path"
+                -authenticationKeyID "$KEY_ID"
+                -authenticationKeyIssuerID "$ISSUER_ID")
+
+          flutter build ios --release --no-codesign --build-number="$(git rev-list --count HEAD)"
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release \
+            -archivePath build/Runner.xcarchive DEVELOPMENT_TEAM="$TEAM_ID" \
+            "${auth[@]}" archive
+          # destination=upload in ExportOptions.plist sends the build to App Store Connect.
+          xcodebuild -exportArchive -archivePath build/Runner.xcarchive \
+            -exportOptionsPlist ios/ExportOptions.plist -exportPath build/ipa \
+            "${auth[@]}"
